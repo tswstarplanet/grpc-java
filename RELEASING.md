@@ -18,7 +18,7 @@ Prerequisites
 If you haven't deployed artifacts to Maven Central before, you need to setup
 your OSSRH (OSS Repository Hosting) account.
 - Follow the instructions on [this
-  page](http://central.sonatype.org/pages/ossrh-guide.html) to set up an
+  page](https://central.sonatype.org/pages/ossrh-guide.html) to set up an
   account with OSSRH.
   - You only need to create the account, not set up a new project
   - Contact a gRPC maintainer to add your account after you have created it.
@@ -43,6 +43,8 @@ $ VERSION_FILES=(
   examples/android/helloworld/app/build.gradle
   examples/android/routeguide/app/build.gradle
   examples/example-alts/build.gradle
+  examples/example-gauth/build.gradle
+  examples/example-gauth/pom.xml
   examples/example-kotlin/build.gradle
   examples/example-kotlin/android/helloworld/app/build.gradle
   examples/example-tls/build.gradle
@@ -165,7 +167,7 @@ several sanity checks on the repository. If this completes successfully, the
 repository can then be `released`, which will begin the process of pushing the
 new artifacts to Maven Central (the staging repository will be destroyed in the
 process). You can see the complete process for releasing to Maven Central on the
-[OSSRH site](http://central.sonatype.org/pages/releasing-the-deployment.html).
+[OSSRH site](https://central.sonatype.org/pages/releasing-the-deployment.html).
 
 Build interop container image
 -----------------------------
@@ -177,7 +179,7 @@ releases. Generate one for the new release by following the
 Update README.md
 ----------------
 After waiting ~1 day and verifying that the release appears on [Maven
-Central](http://mvnrepository.com/), cherry-pick the commit that updated the
+Central](https://mvnrepository.com/), cherry-pick the commit that updated the
 README into the master branch and go through review process.
 
 ```

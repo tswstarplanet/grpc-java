@@ -37,7 +37,7 @@ import org.junit.runners.JUnit4;
 public final class HandshakerServiceChannelTest {
   @Rule
   public final GrpcCleanupRule grpcCleanup = new GrpcCleanupRule();
-  private Server server = grpcCleanup.register(
+  private final Server server = grpcCleanup.register(
       ServerBuilder.forPort(0)
         .addService(new SimpleServiceGrpc.SimpleServiceImplBase() {
           @Override
@@ -61,7 +61,7 @@ public final class HandshakerServiceChannelTest {
     resource = HandshakerServiceChannel.SHARED_HANDSHAKER_CHANNEL;
     Channel channel = resource.create();
     try {
-      assertThat(channel.authority()).isEqualTo("metadata.google.internal:8080");
+      assertThat(channel.authority()).isEqualTo("metadata.google.internal.:8080");
     } finally {
       resource.close(channel);
     }

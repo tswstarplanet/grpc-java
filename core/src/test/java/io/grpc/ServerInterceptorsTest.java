@@ -21,7 +21,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.AdditionalAnswers.delegatesTo;
-import static org.mockito.Matchers.same;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -39,16 +39,25 @@ import java.util.Arrays;
 import java.util.List;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.Mock;
 import org.mockito.Mockito;
-import org.mockito.MockitoAnnotations;
+import org.mockito.junit.MockitoJUnit;
+import org.mockito.junit.MockitoRule;
 
 /** Unit tests for {@link ServerInterceptors}. */
 @RunWith(JUnit4.class)
 public class ServerInterceptorsTest {
+  @Rule
+  public final MockitoRule mocks = MockitoJUnit.rule();
+
+  @Rule
+  public final ExpectedException thrown = ExpectedException.none();
+
   @Mock
   private Marshaller<String> requestMarshaller;
 
@@ -63,7 +72,7 @@ public class ServerInterceptorsTest {
 
   private MethodDescriptor<String, Integer> flowMethod;
 
-  private ServerCall<String, Integer> call = new NoopServerCall<String, Integer>();
+  private ServerCall<String, Integer> call = new NoopServerCall<>();
 
   private ServerServiceDefinition serviceDefinition;
 
@@ -72,7 +81,6 @@ public class ServerInterceptorsTest {
   /** Set up for test. */
   @Before
   public void setUp() {
-    MockitoAnnotations.initMocks(this);
     flowMethod = MethodDescriptor.<String, Integer>newBuilder()
         .setType(MethodType.UNKNOWN)
         .setFullMethodName("basic/flow")
@@ -96,20 +104,25 @@ public class ServerInterceptorsTest {
     verifyZeroInteractions(listener);
   }
 
-  @Test(expected = NullPointerException.class)
+  @Test
   public void npeForNullServiceDefinition() {
     ServerServiceDefinition serviceDef = null;
-    ServerInterceptors.intercept(serviceDef, Arrays.<ServerInterceptor>asList());
+    List<ServerInterceptor> interceptors = Arrays.asList();
+    thrown.expect(NullPointerException.class);
+    ServerInterceptors.intercept(serviceDef, interceptors);
   }
 
-  @Test(expected = NullPointerException.class)
+  @Test
   public void npeForNullInterceptorList() {
+    thrown.expect(NullPointerException.class);
     ServerInterceptors.intercept(serviceDefinition, (List<ServerInterceptor>) null);
   }
 
-  @Test(expected = NullPointerException.class)
+  @Test
   public void npeForNullInterceptor() {
-    ServerInterceptors.intercept(serviceDefinition, Arrays.asList((ServerInterceptor) null));
+    List<ServerInterceptor> interceptors = Arrays.asList((ServerInterceptor) null);
+    thrown.expect(NullPointerException.class);
+    ServerInterceptors.intercept(serviceDefinition, interceptors);
   }
 
   @Test
@@ -269,7 +282,7 @@ public class ServerInterceptorsTest {
   @Test
   public void argumentsPassed() {
     @SuppressWarnings("unchecked")
-    final ServerCall<String, Integer> call2 = new NoopServerCall<String, Integer>();
+    final ServerCall<String, Integer> call2 = new NoopServerCall<>();
     @SuppressWarnings("unchecked")
     final ServerCall.Listener<String> listener2 = mock(ServerCall.Listener.class);
 
@@ -398,7 +411,7 @@ public class ServerInterceptorsTest {
         .intercept(inputStreamMessageService, interceptor2);
     ServerMethodDefinition<InputStream, InputStream> serverMethod =
         (ServerMethodDefinition<InputStream, InputStream>) intercepted2.getMethod("basic/wrapped");
-    ServerCall<InputStream, InputStream> call2 = new NoopServerCall<InputStream, InputStream>();
+    ServerCall<InputStream, InputStream> call2 = new NoopServerCall<>();
     byte[] bytes = {};
     serverMethod
         .getServerCallHandler()
@@ -425,7 +438,7 @@ public class ServerInterceptorsTest {
   }
 
   private ServerCallHandler<String, Integer> anyCallHandler() {
-    return Mockito.<ServerCallHandler<String, Integer>>any();
+    return Mockito.any();
   }
 
   private static class NoopInterceptor implements ServerInterceptor {

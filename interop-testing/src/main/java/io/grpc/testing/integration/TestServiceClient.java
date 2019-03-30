@@ -20,6 +20,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.Files;
 import io.grpc.ManagedChannel;
 import io.grpc.alts.AltsChannelBuilder;
+import io.grpc.alts.ComputeEngineChannelBuilder;
 import io.grpc.alts.GoogleDefaultChannelBuilder;
 import io.grpc.internal.AbstractManagedChannelImplBuilder;
 import io.grpc.internal.GrpcUtil;
@@ -33,6 +34,7 @@ import io.netty.handler.ssl.SslContext;
 import java.io.File;
 import java.io.FileInputStream;
 import java.nio.charset.Charset;
+import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLSocketFactory;
 
 /**
@@ -277,6 +279,20 @@ public class TestServiceClient {
         tester.computeEngineCreds(defaultServiceAccount, oauthScope);
         break;
 
+      case COMPUTE_ENGINE_CHANNEL_CREDENTIALS: {
+        ManagedChannel channel = ComputeEngineChannelBuilder
+            .forAddress(serverHost, serverPort).build();
+        try {
+          TestServiceGrpc.TestServiceBlockingStub computeEngineStub =
+              TestServiceGrpc.newBlockingStub(channel);
+          tester.computeEngineChannelCredentials(defaultServiceAccount, computeEngineStub);
+        } finally {
+          channel.shutdownNow();
+          channel.awaitTermination(5, TimeUnit.SECONDS);
+        }
+        break;
+      }
+
       case SERVICE_ACCOUNT_CREDS: {
         String jsonKey = Files.asCharSource(new File(serviceAccountKeyFile), UTF_8).read();
         FileInputStream credentialsStream = new FileInputStream(new File(serviceAccountKeyFile));
@@ -301,6 +317,19 @@ public class TestServiceClient {
         String jsonKey = Files.asCharSource(new File(serviceAccountKeyFile), UTF_8).read();
         FileInputStream credentialsStream = new FileInputStream(new File(serviceAccountKeyFile));
         tester.perRpcCreds(jsonKey, credentialsStream, oauthScope);
+        break;
+      }
+
+      case GOOGLE_DEFAULT_CREDENTIALS: {
+        ManagedChannel channel = GoogleDefaultChannelBuilder.forAddress(
+            serverHost, serverPort).build();
+        try {
+          TestServiceGrpc.TestServiceBlockingStub googleDefaultStub =
+              TestServiceGrpc.newBlockingStub(channel);
+          tester.googleDefaultCredentials(defaultServiceAccount, googleDefaultStub);
+        } finally {
+          channel.shutdownNow();
+        }
         break;
       }
 
@@ -359,6 +388,10 @@ public class TestServiceClient {
       if (customCredentialsType != null
           && customCredentialsType.equals("google_default_credentials")) {
         return GoogleDefaultChannelBuilder.forAddress(serverHost, serverPort).build();
+      }
+      if (customCredentialsType != null
+          && customCredentialsType.equals("compute_engine_channel_creds")) {
+        return ComputeEngineChannelBuilder.forAddress(serverHost, serverPort).build();
       }
       if (useAlts) {
         return AltsChannelBuilder.forAddress(serverHost, serverPort).build();

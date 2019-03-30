@@ -55,11 +55,14 @@ import io.grpc.InternalWithLogId;
 import io.grpc.LoadBalancer;
 import io.grpc.LoadBalancer.PickResult;
 import io.grpc.LoadBalancer.PickSubchannelArgs;
+import io.grpc.LoadBalancer.ResolvedAddresses;
 import io.grpc.LoadBalancer.SubchannelPicker;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.NameResolver;
+import io.grpc.NameResolver.ResolutionResult;
+import io.grpc.ProxyDetector;
 import io.grpc.Status;
 import io.grpc.SynchronizationContext;
 import io.grpc.SynchronizationContext.ScheduledHandle;
@@ -125,7 +128,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
   private final InternalLogId logId;
   private final String target;
   private final NameResolver.Factory nameResolverFactory;
-  private final Attributes nameResolverParams;
+  private final NameResolver.Helper nameResolverHelper;
   private final LoadBalancer.Factory loadBalancerFactory;
   private final ClientTransportFactory transportFactory;
   private final ScheduledExecutorForBalancer scheduledExecutorForBalancer;
@@ -193,10 +196,10 @@ final class ManagedChannelImpl extends ManagedChannel implements
   // Must be mutated from syncContext
   // If any monitoring hook to be added later needs to get a snapshot of this Set, we could
   // switch to a ConcurrentHashMap.
-  private final Set<InternalSubchannel> subchannels = new HashSet<InternalSubchannel>(16, .75f);
+  private final Set<InternalSubchannel> subchannels = new HashSet<>(16, .75f);
 
   // Must be mutated from syncContext
-  private final Set<OobChannel> oobChannels = new HashSet<OobChannel>(1, .75f);
+  private final Set<OobChannel> oobChannels = new HashSet<>(1, .75f);
 
   // reprocess() must be run from syncContext
   private final DelayedClientTransport delayedTransport;
@@ -233,10 +236,20 @@ final class ManagedChannelImpl extends ManagedChannel implements
   private final ChannelTracer channelTracer;
   private final ChannelLogger channelLogger;
   private final InternalChannelz channelz;
+  // Must be mutated and read from syncContext
   @CheckForNull
   private Boolean haveBackends; // a flag for doing channel tracing when flipped
+  // Must be mutated and read from constructor or syncContext
+  // TODO(notcarl): check this value when error in service config resolution
   @Nullable
-  private Map<String, Object> lastServiceConfig; // used for channel tracing when value changed
+  private Map<String, ?> lastServiceConfig; // used for channel tracing when value changed
+  @Nullable
+  private final Map<String, ?> defaultServiceConfig;
+  // Must be mutated and read from constructor or syncContext
+  // See service config error handling spec for reference.
+  // TODO(notcarl): check this value when error in service config resolution
+  private boolean waitingForServiceConfig = true;
+  private final boolean lookUpServiceConfig;
 
   // One instance per channel.
   private final ChannelBufferMeter channelBufferUsed = new ChannelBufferMeter();
@@ -308,16 +321,21 @@ final class ManagedChannelImpl extends ManagedChannel implements
   }
 
   // Must be called from syncContext
-  private void shutdownNameResolverAndLoadBalancer(boolean verifyActive) {
-    if (verifyActive) {
-      checkState(nameResolver != null, "nameResolver is null");
+  private void shutdownNameResolverAndLoadBalancer(boolean channelIsActive) {
+    syncContext.throwIfNotInThisSynchronizationContext();
+    if (channelIsActive) {
+      checkState(nameResolverStarted, "nameResolver is not started");
       checkState(lbHelper != null, "lbHelper is null");
     }
     if (nameResolver != null) {
       cancelNameResolverBackoff();
       nameResolver.shutdown();
-      nameResolver = null;
       nameResolverStarted = false;
+      if (channelIsActive) {
+        nameResolver = getNameResolver(target, nameResolverFactory, nameResolverHelper);
+      } else {
+        nameResolver = null;
+      }
     }
     if (lbHelper != null) {
       lbHelper.lb.shutdown();
@@ -333,6 +351,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
    */
   @VisibleForTesting
   void exitIdleMode() {
+    syncContext.throwIfNotInThisSynchronizationContext();
     if (shutdown.get() || panicMode) {
       return;
     }
@@ -355,13 +374,9 @@ final class ManagedChannelImpl extends ManagedChannel implements
     // may throw. We don't want to confuse our state, even if we will enter panic mode.
     this.lbHelper = lbHelper;
 
-    NameResolverListenerImpl listener = new NameResolverListenerImpl(lbHelper, nameResolver);
-    try {
-      nameResolver.start(listener);
-      nameResolverStarted = true;
-    } catch (Throwable t) {
-      listener.onError(Status.fromThrowable(t));
-    }
+    NameResolverObserver observer = new NameResolverObserver(lbHelper, nameResolver);
+    nameResolver.start(observer);
+    nameResolverStarted = true;
   }
 
   // Must be run from syncContext
@@ -372,7 +387,6 @@ final class ManagedChannelImpl extends ManagedChannel implements
     // which are bugs.
     shutdownNameResolverAndLoadBalancer(true);
     delayedTransport.reprocess(null);
-    nameResolver = getNameResolver(target, nameResolverFactory, nameResolverParams);
     channelLogger.log(ChannelLogLevel.INFO, "Entering IDLE state");
     channelStateManager.gotoState(IDLE);
     if (inUseStateAggregator.isInUse()) {
@@ -399,9 +413,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
     @Override
     public void run() {
       scheduledNameResolverRefresh = null;
-      if (nameResolver != null) {
-        nameResolver.refresh();
-      }
+      refreshNameResolution();
     }
   }
 
@@ -421,11 +433,19 @@ final class ManagedChannelImpl extends ManagedChannel implements
     }
   }
 
-  // Must be run from syncContext
-  private void refreshNameResolutionNow() {
+  /**
+   * Force name resolution refresh to happen immediately and reset refresh back-off. Must be run
+   * from syncContext.
+   */
+  private void refreshAndResetNameResolution() {
     syncContext.throwIfNotInThisSynchronizationContext();
     cancelNameResolverBackoff();
-    if (nameResolver != null) {
+    refreshNameResolution();
+  }
+
+  private void refreshNameResolution() {
+    syncContext.throwIfNotInThisSynchronizationContext();
+    if (nameResolverStarted) {
       nameResolver.refresh();
     }
   }
@@ -534,19 +554,34 @@ final class ManagedChannelImpl extends ManagedChannel implements
     this.target = checkNotNull(builder.target, "target");
     this.logId = InternalLogId.allocate("Channel", target);
     this.nameResolverFactory = builder.getNameResolverFactory();
-    this.nameResolverParams = checkNotNull(builder.getNameResolverParams(), "nameResolverParams");
-    this.nameResolver = getNameResolver(target, nameResolverFactory, nameResolverParams);
+    ProxyDetector proxyDetector =
+        builder.proxyDetector != null ? builder.proxyDetector : GrpcUtil.getDefaultProxyDetector();
+    this.retryEnabled = builder.retryEnabled && !builder.temporarilyDisableRetry;
+    AutoConfiguredLoadBalancerFactory autoConfiguredLoadBalancerFactory = null;
+    if (builder.loadBalancerFactory == null) {
+      autoConfiguredLoadBalancerFactory =
+          new AutoConfiguredLoadBalancerFactory(builder.defaultLbPolicy);
+      this.loadBalancerFactory = autoConfiguredLoadBalancerFactory;
+    } else {
+      this.loadBalancerFactory = builder.loadBalancerFactory;
+    }
+    this.nameResolverHelper =
+        new NrHelper(
+            builder.getDefaultPort(),
+            proxyDetector,
+            syncContext,
+            retryEnabled,
+            builder.maxRetryAttempts,
+            builder.maxHedgedAttempts,
+            autoConfiguredLoadBalancerFactory);
+    this.nameResolver = getNameResolver(target, nameResolverFactory, nameResolverHelper);
     this.timeProvider = checkNotNull(timeProvider, "timeProvider");
     maxTraceEvents = builder.maxTraceEvents;
     channelTracer = new ChannelTracer(
         logId, builder.maxTraceEvents, timeProvider.currentTimeNanos(),
         "Channel for '" + target + "'");
     channelLogger = new ChannelLoggerImpl(channelTracer, timeProvider);
-    if (builder.loadBalancerFactory == null) {
-      this.loadBalancerFactory = new AutoConfiguredLoadBalancerFactory(builder.defaultLbPolicy);
-    } else {
-      this.loadBalancerFactory = builder.loadBalancerFactory;
-    }
+
     this.executorPool = checkNotNull(builder.executorPool, "executorPool");
     this.balancerRpcExecutorPool = checkNotNull(balancerRpcExecutorPool, "balancerRpcExecutorPool");
     this.balancerRpcExecutorHolder = new ExecutorHolder(balancerRpcExecutorPool);
@@ -558,9 +593,12 @@ final class ManagedChannelImpl extends ManagedChannel implements
         new CallCredentialsApplyingTransportFactory(clientTransportFactory, this.executor);
     this.scheduledExecutorForBalancer =
         new ScheduledExecutorForBalancer(transportFactory.getScheduledExecutorService());
-    this.retryEnabled = builder.retryEnabled && !builder.temporarilyDisableRetry;
+
     serviceConfigInterceptor = new ServiceConfigInterceptor(
         retryEnabled, builder.maxRetryAttempts, builder.maxHedgedAttempts);
+    this.defaultServiceConfig = builder.defaultServiceConfig;
+    this.lastServiceConfig = defaultServiceConfig;
+    this.lookUpServiceConfig = builder.lookUpServiceConfig;
     Channel channel = new RealChannel(nameResolver.getServiceAuthority());
     channel = ClientInterceptors.intercept(channel, serviceConfigInterceptor);
     if (builder.binlog != null) {
@@ -601,11 +639,28 @@ final class ManagedChannelImpl extends ManagedChannel implements
     channelCallTracer = callTracerFactory.create();
     this.channelz = checkNotNull(builder.channelz);
     channelz.addRootChannel(this);
+
+    if (!lookUpServiceConfig) {
+      if (defaultServiceConfig != null) {
+        channelLogger.log(
+            ChannelLogLevel.INFO, "Service config look-up disabled, using default service config");
+      }
+      handleServiceConfigUpdate();
+    }
+  }
+
+  // May only be called in constructor or syncContext
+  private void handleServiceConfigUpdate() {
+    waitingForServiceConfig = false;
+    serviceConfigInterceptor.handleUpdate(lastServiceConfig);
+    if (retryEnabled) {
+      throttle = ServiceConfigUtil.getThrottlePolicy(lastServiceConfig);
+    }
   }
 
   @VisibleForTesting
   static NameResolver getNameResolver(String target, NameResolver.Factory nameResolverFactory,
-      Attributes nameResolverParams) {
+      NameResolver.Helper nameResolverHelper) {
     // Finding a NameResolver. Try using the target string as the URI. If that fails, try prepending
     // "dns:///".
     URI targetUri = null;
@@ -620,7 +675,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
       uriSyntaxErrors.append(e.getMessage());
     }
     if (targetUri != null) {
-      NameResolver resolver = nameResolverFactory.newNameResolver(targetUri, nameResolverParams);
+      NameResolver resolver = nameResolverFactory.newNameResolver(targetUri, nameResolverHelper);
       if (resolver != null) {
         return resolver;
       }
@@ -638,7 +693,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
         // Should not be possible.
         throw new IllegalArgumentException(e);
       }
-      NameResolver resolver = nameResolverFactory.newNameResolver(targetUri, nameResolverParams);
+      NameResolver resolver = nameResolverFactory.newNameResolver(targetUri, nameResolverHelper);
       if (resolver != null) {
         return resolver;
       }
@@ -791,14 +846,14 @@ final class ManagedChannelImpl extends ManagedChannel implements
     @Override
     public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(MethodDescriptor<ReqT, RespT> method,
         CallOptions callOptions) {
-      return new ClientCallImpl<ReqT, RespT>(
-              method,
-              getCallExecutor(callOptions),
-              callOptions,
-              transportProvider,
-              terminated ? null : transportFactory.getScheduledExecutorService(),
-              channelCallTracer,
-              retryEnabled)
+      return new ClientCallImpl<>(
+          method,
+          getCallExecutor(callOptions),
+          callOptions,
+          transportProvider,
+          terminated ? null : transportFactory.getScheduledExecutorService(),
+          channelCallTracer,
+          retryEnabled)
           .setFullStreamDecompression(fullStreamDecompression)
           .setDecompressorRegistry(decompressorRegistry)
           .setCompressorRegistry(compressorRegistry);
@@ -871,7 +926,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
         }
         if (scheduledNameResolverRefresh != null && scheduledNameResolverRefresh.isPending()) {
           checkState(nameResolverStarted, "name resolver must be started");
-          refreshNameResolutionNow();
+          refreshAndResetNameResolution();
         }
         for (InternalSubchannel subchannel : subchannels) {
           subchannel.resetConnectBackoff();
@@ -990,7 +1045,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
     // Must be called from syncContext
     private void handleInternalSubchannelState(ConnectivityStateInfo newState) {
       if (newState.getState() == TRANSIENT_FAILURE || newState.getState() == IDLE) {
-        refreshNameResolutionNow();
+        refreshAndResetNameResolution();
       }
     }
 
@@ -1122,7 +1177,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
       final class LoadBalancerRefreshNameResolution implements Runnable {
         @Override
         public void run() {
-          refreshNameResolutionNow();
+          refreshAndResetNameResolution();
         }
       }
 
@@ -1226,6 +1281,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
       return ManagedChannelImpl.this.authority();
     }
 
+    @Deprecated
     @Override
     public NameResolver.Factory getNameResolverFactory() {
       return nameResolverFactory;
@@ -1247,47 +1303,69 @@ final class ManagedChannelImpl extends ManagedChannel implements
     }
   }
 
-  private class NameResolverListenerImpl implements NameResolver.Listener {
+  private final class NameResolverObserver extends NameResolver.Observer {
     final LbHelperImpl helper;
     final NameResolver resolver;
 
-    NameResolverListenerImpl(LbHelperImpl helperImpl, NameResolver resolver) {
+    NameResolverObserver(LbHelperImpl helperImpl, NameResolver resolver) {
       this.helper = checkNotNull(helperImpl, "helperImpl");
       this.resolver = checkNotNull(resolver, "resolver");
     }
 
     @Override
-    public void onAddresses(final List<EquivalentAddressGroup> servers, final Attributes config) {
-      channelLogger.log(
-          ChannelLogLevel.DEBUG, "Resolved address: {0}, config={1}", servers, config);
-
-      if (haveBackends == null || !haveBackends) {
-        channelLogger.log(ChannelLogLevel.INFO, "Address resolved: {0}", servers);
-        haveBackends = true;
-      }
-      final Map<String, Object> serviceConfig =
-          config.get(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG);
-      if (serviceConfig != null && !serviceConfig.equals(lastServiceConfig)) {
-        channelLogger.log(ChannelLogLevel.INFO, "Service config changed");
-        lastServiceConfig = serviceConfig;
-      }
-
+    public void onResult(final ResolutionResult resolutionResult) {
       final class NamesResolved implements Runnable {
+
+        @SuppressWarnings("ReferenceEquality")
         @Override
         public void run() {
-          // Call LB only if it's not shutdown.  If LB is shutdown, lbHelper won't match.
-          if (NameResolverListenerImpl.this.helper != ManagedChannelImpl.this.lbHelper) {
-            return;
+          List<EquivalentAddressGroup> servers = resolutionResult.getServers();
+          Attributes attrs = resolutionResult.getAttributes();
+          channelLogger.log(
+              ChannelLogLevel.DEBUG, "Resolved address: {0}, config={1}", servers, attrs);
+
+          if (haveBackends == null || !haveBackends) {
+            channelLogger.log(ChannelLogLevel.INFO, "Address resolved: {0}", servers);
+            haveBackends = true;
           }
 
           nameResolverBackoffPolicy = null;
 
-          if (serviceConfig != null) {
-            try {
-              serviceConfigInterceptor.handleUpdate(serviceConfig);
-              if (retryEnabled) {
-                throttle = getThrottle(config);
+          // Assuming no error in config resolution for now.
+          final Map<String, ?> serviceConfig =
+              attrs.get(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG);
+          Map<String, ?> effectiveServiceConfig;
+          if (!lookUpServiceConfig) {
+            if (serviceConfig != null) {
+              channelLogger.log(
+                  ChannelLogLevel.INFO,
+                  "Service config from name resolver discarded by channel settings");
+            }
+            effectiveServiceConfig = defaultServiceConfig;
+          } else {
+            // Try to use config if returned from name resolver
+            // Otherwise, try to use the default config if available
+            if (serviceConfig != null) {
+              effectiveServiceConfig = serviceConfig;
+            } else {
+              effectiveServiceConfig = defaultServiceConfig;
+              if (defaultServiceConfig != null) {
+                channelLogger.log(
+                    ChannelLogLevel.INFO,
+                    "Received no service config, using default service config");
               }
+            }
+
+            // FIXME(notcarl): reference equality is not right (although not harmful) right now.
+            //                 Name resolver should return the same config if txt record is the same
+            if (effectiveServiceConfig != lastServiceConfig) {
+              channelLogger.log(ChannelLogLevel.INFO,
+                  "Service config changed{0}", effectiveServiceConfig == null ? " to null" : "");
+              lastServiceConfig = effectiveServiceConfig;
+            }
+
+            try {
+              handleServiceConfigUpdate();
             } catch (RuntimeException re) {
               logger.log(
                   Level.WARNING,
@@ -1296,11 +1374,24 @@ final class ManagedChannelImpl extends ManagedChannel implements
             }
           }
 
-          if (servers.isEmpty() && !helper.lb.canHandleEmptyAddressListFromNameResolution()) {
-            onError(Status.UNAVAILABLE.withDescription(
-                    "Name resolver " + resolver + " returned an empty list"));
-          } else {
-            helper.lb.handleResolvedAddressGroups(servers, config);
+          // Call LB only if it's not shutdown.  If LB is shutdown, lbHelper won't match.
+          if (NameResolverObserver.this.helper == ManagedChannelImpl.this.lbHelper) {
+            if (servers.isEmpty() && !helper.lb.canHandleEmptyAddressListFromNameResolution()) {
+              handleErrorInSyncContext(Status.UNAVAILABLE.withDescription(
+                  "Name resolver " + resolver + " returned an empty list"));
+            } else {
+              Attributes effectiveAttrs = attrs;
+              if (effectiveServiceConfig != serviceConfig) {
+                effectiveAttrs = attrs.toBuilder()
+                    .set(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG, effectiveServiceConfig)
+                    .build();
+              }
+              helper.lb.handleResolvedAddresses(
+                  ResolvedAddresses.newBuilder()
+                      .setServers(servers)
+                      .setAttributes(effectiveAttrs)
+                      .build());
+            }
           }
         }
       }
@@ -1311,49 +1402,47 @@ final class ManagedChannelImpl extends ManagedChannel implements
     @Override
     public void onError(final Status error) {
       checkArgument(!error.isOk(), "the error status must not be OK");
+      final class NameResolverErrorHandler implements Runnable {
+        @Override
+        public void run() {
+          handleErrorInSyncContext(error);
+        }
+      }
+
+      syncContext.execute(new NameResolverErrorHandler());
+    }
+
+    private void handleErrorInSyncContext(Status error) {
       logger.log(Level.WARNING, "[{0}] Failed to resolve name. status={1}",
           new Object[] {getLogId(), error});
       if (haveBackends == null || haveBackends) {
         channelLogger.log(ChannelLogLevel.WARNING, "Failed to resolve name: {0}", error);
         haveBackends = false;
       }
-      final class NameResolverErrorHandler implements Runnable {
-        @Override
-        public void run() {
-          // Call LB only if it's not shutdown.  If LB is shutdown, lbHelper won't match.
-          if (NameResolverListenerImpl.this.helper != ManagedChannelImpl.this.lbHelper) {
-            return;
-          }
-          helper.lb.handleNameResolutionError(error);
-          if (scheduledNameResolverRefresh != null && scheduledNameResolverRefresh.isPending()) {
-            // The name resolver may invoke onError multiple times, but we only want to
-            // schedule one backoff attempt
-            // TODO(ericgribkoff) Update contract of NameResolver.Listener or decide if we
-            // want to reset the backoff interval upon repeated onError() calls
-            return;
-          }
-          if (nameResolverBackoffPolicy == null) {
-            nameResolverBackoffPolicy = backoffPolicyProvider.get();
-          }
-          long delayNanos = nameResolverBackoffPolicy.nextBackoffNanos();
-          channelLogger.log(
-                ChannelLogLevel.DEBUG,
-                "Scheduling DNS resolution backoff for {0} ns", delayNanos);
-          scheduledNameResolverRefresh =
-              syncContext.schedule(
-                  new DelayedNameResolverRefresh(), delayNanos, TimeUnit.NANOSECONDS,
-                  transportFactory .getScheduledExecutorService());
-        }
+      // Call LB only if it's not shutdown.  If LB is shutdown, lbHelper won't match.
+      if (NameResolverObserver.this.helper != ManagedChannelImpl.this.lbHelper) {
+        return;
       }
-
-      syncContext.execute(new NameResolverErrorHandler());
+      helper.lb.handleNameResolutionError(error);
+      if (scheduledNameResolverRefresh != null && scheduledNameResolverRefresh.isPending()) {
+        // The name resolver may invoke onError multiple times, but we only want to
+        // schedule one backoff attempt
+        // TODO(ericgribkoff) Update contract of NameResolver.Listener or decide if we
+        // want to reset the backoff interval upon repeated onError() calls
+        return;
+      }
+      if (nameResolverBackoffPolicy == null) {
+        nameResolverBackoffPolicy = backoffPolicyProvider.get();
+      }
+      long delayNanos = nameResolverBackoffPolicy.nextBackoffNanos();
+      channelLogger.log(
+          ChannelLogLevel.DEBUG,
+          "Scheduling DNS resolution backoff for {0} ns", delayNanos);
+      scheduledNameResolverRefresh =
+          syncContext.schedule(
+              new DelayedNameResolverRefresh(), delayNanos, TimeUnit.NANOSECONDS,
+              transportFactory .getScheduledExecutorService());
     }
-  }
-
-  @Nullable
-  private static Throttle getThrottle(Attributes config) {
-    return ServiceConfigUtil.getThrottlePolicy(
-        config.get(GrpcAttributes.NAME_RESOLVER_SERVICE_CONFIG));
   }
 
   private final class SubchannelImpl extends AbstractSubchannel {
@@ -1639,6 +1728,82 @@ final class ManagedChannelImpl extends ManagedChannel implements
     @Override
     public void execute(Runnable command) {
       delegate.execute(command);
+    }
+  }
+
+  @VisibleForTesting
+  static final class NrHelper extends NameResolver.Helper {
+
+    private final int defaultPort;
+    private final ProxyDetector proxyDetector;
+    private final SynchronizationContext syncCtx;
+    private final boolean retryEnabled;
+    private final int maxRetryAttemptsLimit;
+    private final int maxHedgedAttemptsLimit;
+    // TODO(zhangkun83): remove this once setting a specific LB is prohibited.
+    @Nullable private final AutoConfiguredLoadBalancerFactory autoLoadBalancerFactory;
+
+    NrHelper(
+        int defaultPort,
+        ProxyDetector proxyDetector,
+        SynchronizationContext syncCtx,
+        boolean retryEnabled,
+        int maxRetryAttemptsLimit,
+        int maxHedgedAttemptsLimit,
+        AutoConfiguredLoadBalancerFactory autoLoadBalancerFactory) {
+      this.defaultPort = defaultPort;
+      this.proxyDetector = checkNotNull(proxyDetector, "proxyDetector");
+      this.syncCtx = checkNotNull(syncCtx, "syncCtx");
+      this.retryEnabled = retryEnabled;
+      this.maxRetryAttemptsLimit = maxRetryAttemptsLimit;
+      this.maxHedgedAttemptsLimit = maxHedgedAttemptsLimit;
+      this.autoLoadBalancerFactory = autoLoadBalancerFactory;
+    }
+
+    @Override
+    public int getDefaultPort() {
+      return defaultPort;
+    }
+
+    @Override
+    public ProxyDetector getProxyDetector() {
+      return proxyDetector;
+    }
+
+    @Override
+    public SynchronizationContext getSynchronizationContext() {
+      return syncCtx;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public ConfigOrError parseServiceConfig(Map<String, ?> rawServiceConfig) {
+      try {
+        Object loadBalancingPolicySelection;
+        if (autoLoadBalancerFactory != null) {
+          ConfigOrError choiceFromLoadBalancer =
+              autoLoadBalancerFactory.selectLoadBalancerPolicy(rawServiceConfig);
+          if (choiceFromLoadBalancer == null) {
+            loadBalancingPolicySelection = null;
+          } else if (choiceFromLoadBalancer.getError() != null) {
+            return ConfigOrError.fromError(choiceFromLoadBalancer.getError());
+          } else {
+            loadBalancingPolicySelection = choiceFromLoadBalancer.getConfig();
+          }
+        } else {
+          loadBalancingPolicySelection = null;
+        }
+        return ConfigOrError.fromConfig(
+            ManagedChannelServiceConfig.fromServiceConfig(
+                rawServiceConfig,
+                retryEnabled,
+                maxRetryAttemptsLimit,
+                maxHedgedAttemptsLimit,
+                loadBalancingPolicySelection));
+      } catch (RuntimeException e) {
+        return ConfigOrError.fromError(
+            Status.UNKNOWN.withDescription("failed to parse service config").withCause(e));
+      }
     }
   }
 }

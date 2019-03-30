@@ -27,10 +27,11 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Matchers.isNull;
-import static org.mockito.Matchers.same;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -87,7 +88,9 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.AdditionalMatchers;
 import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
 
 /** Tests for {@link BinlogHelper}. */
 @RunWith(JUnit4.class)
@@ -916,7 +919,7 @@ public final class BinlogHelperTest {
   @SuppressWarnings({"rawtypes", "unchecked"})
   public void serverDeadlineLogged() {
     final AtomicReference<ServerCall> interceptedCall =
-        new AtomicReference<ServerCall>();
+        new AtomicReference<>();
     final ServerCall.Listener mockListener = mock(ServerCall.Listener.class);
 
     final MethodDescriptor<byte[], byte[]> method =
@@ -959,12 +962,12 @@ public final class BinlogHelperTest {
     verify(mockSinkWriter).logClientHeader(
         /*seq=*/ eq(1L),
         eq("service/method"),
-        isNull(String.class),
+        ArgumentMatchers.<String>isNull(),
         timeoutCaptor.capture(),
         any(Metadata.class),
         eq(Logger.LOGGER_SERVER),
         eq(CALL_ID),
-        isNull(SocketAddress.class));
+        ArgumentMatchers.<SocketAddress>isNull());
     verifyNoMoreInteractions(mockSinkWriter);
     Duration timeout = timeoutCaptor.getValue();
     assertThat(TimeUnit.SECONDS.toNanos(1) - Durations.toNanos(timeout))
@@ -994,7 +997,7 @@ public final class BinlogHelperTest {
                   public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
                       MethodDescriptor<RequestT, ResponseT> methodDescriptor,
                       CallOptions callOptions) {
-                    return new NoopClientCall<RequestT, ResponseT>();
+                    return new NoopClientCall<>();
                   }
 
                   @Override
@@ -1004,15 +1007,17 @@ public final class BinlogHelperTest {
                 });
     call.start(mockListener, new Metadata());
     ArgumentCaptor<Duration> callOptTimeoutCaptor = ArgumentCaptor.forClass(Duration.class);
-    verify(mockSinkWriter).logClientHeader(
-        any(Integer.class),
-        any(String.class),
-        any(String.class),
-        callOptTimeoutCaptor.capture(),
-        any(Metadata.class),
-        any(GrpcLogEntry.Logger.class),
-        any(Long.class),
-        any(SocketAddress.class));
+    verify(mockSinkWriter)
+        .logClientHeader(
+            anyLong(),
+            AdditionalMatchers.or(ArgumentMatchers.<String>isNull(), anyString()),
+            AdditionalMatchers.or(ArgumentMatchers.<String>isNull(), anyString()),
+            callOptTimeoutCaptor.capture(),
+            any(Metadata.class),
+            any(GrpcLogEntry.Logger.class),
+            anyLong(),
+            AdditionalMatchers.or(ArgumentMatchers.<SocketAddress>isNull(),
+                ArgumentMatchers.<SocketAddress>any()));
     Duration timeout = callOptTimeoutCaptor.getValue();
     assertThat(TimeUnit.SECONDS.toNanos(1) - Durations.toNanos(timeout))
         .isAtMost(TimeUnit.MILLISECONDS.toNanos(250));
@@ -1047,7 +1052,7 @@ public final class BinlogHelperTest {
                       public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
                           MethodDescriptor<RequestT, ResponseT> methodDescriptor,
                           CallOptions callOptions) {
-                        return new NoopClientCall<RequestT, ResponseT>();
+                        return new NoopClientCall<>();
                       }
 
                       @Override
@@ -1060,15 +1065,17 @@ public final class BinlogHelperTest {
     ClientCall.Listener<byte[]> mockListener = mock(ClientCall.Listener.class);
     callFuture.get().start(mockListener, new Metadata());
     ArgumentCaptor<Duration> callOptTimeoutCaptor = ArgumentCaptor.forClass(Duration.class);
-    verify(mockSinkWriter).logClientHeader(
-        any(Integer.class),
-        any(String.class),
-        any(String.class),
-        callOptTimeoutCaptor.capture(),
-        any(Metadata.class),
-        any(GrpcLogEntry.Logger.class),
-        any(Long.class),
-        any(SocketAddress.class));
+    verify(mockSinkWriter)
+        .logClientHeader(
+            anyLong(),
+            anyString(),
+            ArgumentMatchers.<String>any(),
+            callOptTimeoutCaptor.capture(),
+            any(Metadata.class),
+            any(GrpcLogEntry.Logger.class),
+            anyLong(),
+            AdditionalMatchers.or(ArgumentMatchers.<SocketAddress>isNull(),
+                ArgumentMatchers.<SocketAddress>any()));
     Duration timeout = callOptTimeoutCaptor.getValue();
     assertThat(TimeUnit.SECONDS.toNanos(1) - Durations.toNanos(timeout))
         .isAtMost(TimeUnit.MILLISECONDS.toNanos(250));
@@ -1078,10 +1085,10 @@ public final class BinlogHelperTest {
   @SuppressWarnings({"rawtypes", "unchecked"})
   public void clientInterceptor() throws Exception {
     final AtomicReference<ClientCall.Listener> interceptedListener =
-        new AtomicReference<ClientCall.Listener>();
+        new AtomicReference<>();
     // capture these manually because ClientCall can not be mocked
-    final AtomicReference<Metadata> actualClientInitial = new AtomicReference<Metadata>();
-    final AtomicReference<Object> actualRequest = new AtomicReference<Object>();
+    final AtomicReference<Metadata> actualClientInitial = new AtomicReference<>();
+    final AtomicReference<Object> actualRequest = new AtomicReference<>();
 
     final SettableFuture<Void> halfCloseCalled = SettableFuture.create();
     final SettableFuture<Void> cancelCalled = SettableFuture.create();
@@ -1149,11 +1156,11 @@ public final class BinlogHelperTest {
           /*seq=*/ eq(1L),
           eq("service/method"),
           eq("the-authority"),
-          isNull(Duration.class),
+          ArgumentMatchers.<Duration>isNull(),
           same(clientInitial),
           eq(Logger.LOGGER_CLIENT),
           eq(CALL_ID),
-          isNull(SocketAddress.class));
+          ArgumentMatchers.<SocketAddress>isNull());
       verifyNoMoreInteractions(mockSinkWriter);
       assertSame(clientInitial, actualClientInitial.get());
     }
@@ -1225,7 +1232,7 @@ public final class BinlogHelperTest {
           same(trailers),
           eq(Logger.LOGGER_CLIENT),
           eq(CALL_ID),
-          isNull(SocketAddress.class));
+          ArgumentMatchers.<SocketAddress>isNull());
       verifyNoMoreInteractions(mockSinkWriter);
       verify(mockListener).onClose(same(status), same(trailers));
     }
@@ -1245,10 +1252,10 @@ public final class BinlogHelperTest {
   @SuppressWarnings({"rawtypes", "unchecked"})
   public void clientInterceptor_trailersOnlyResponseLogsPeerAddress() throws Exception {
     final AtomicReference<ClientCall.Listener> interceptedListener =
-        new AtomicReference<ClientCall.Listener>();
+        new AtomicReference<>();
     // capture these manually because ClientCall can not be mocked
-    final AtomicReference<Metadata> actualClientInitial = new AtomicReference<Metadata>();
-    final AtomicReference<Object> actualRequest = new AtomicReference<Object>();
+    final AtomicReference<Metadata> actualClientInitial = new AtomicReference<>();
+    final AtomicReference<Object> actualRequest = new AtomicReference<>();
 
     Channel channel = new Channel() {
       @Override
@@ -1299,13 +1306,13 @@ public final class BinlogHelperTest {
     interceptedCall.start(mockListener, clientInitial);
     verify(mockSinkWriter).logClientHeader(
         /*seq=*/ eq(1L),
-        any(String.class),
-        any(String.class),
+        anyString(),
+        anyString(),
         any(Duration.class),
         any(Metadata.class),
         eq(Logger.LOGGER_CLIENT),
         eq(CALL_ID),
-        isNull(SocketAddress.class));
+        ArgumentMatchers.<SocketAddress>isNull());
     verifyNoMoreInteractions(mockSinkWriter);
 
     // trailer only response
@@ -1330,14 +1337,14 @@ public final class BinlogHelperTest {
   @SuppressWarnings({"rawtypes", "unchecked"})
   public void serverInterceptor() throws Exception {
     final AtomicReference<ServerCall> interceptedCall =
-        new AtomicReference<ServerCall>();
+        new AtomicReference<>();
     ServerCall.Listener<byte[]> capturedListener;
     final ServerCall.Listener mockListener = mock(ServerCall.Listener.class);
     // capture these manually because ServerCall can not be mocked
-    final AtomicReference<Metadata> actualServerInitial = new AtomicReference<Metadata>();
-    final AtomicReference<byte[]> actualResponse = new AtomicReference<byte[]>();
-    final AtomicReference<Status> actualStatus = new AtomicReference<Status>();
-    final AtomicReference<Metadata> actualTrailers = new AtomicReference<Metadata>();
+    final AtomicReference<Metadata> actualServerInitial = new AtomicReference<>();
+    final AtomicReference<byte[]> actualResponse = new AtomicReference<>();
+    final AtomicReference<Status> actualStatus = new AtomicReference<>();
+    final AtomicReference<Metadata> actualTrailers = new AtomicReference<>();
 
     // begin call and receive client header
     {
@@ -1402,7 +1409,7 @@ public final class BinlogHelperTest {
           /*seq=*/ eq(1L),
           eq("service/method"),
           eq("the-authority"),
-          isNull(Duration.class),
+          ArgumentMatchers.<Duration>isNull(),
           same(clientInitial),
           eq(Logger.LOGGER_SERVER),
           eq(CALL_ID),
@@ -1419,7 +1426,7 @@ public final class BinlogHelperTest {
           same(serverInital),
           eq(Logger.LOGGER_SERVER),
           eq(CALL_ID),
-          isNull(SocketAddress.class));
+          ArgumentMatchers.<SocketAddress>isNull());
       verifyNoMoreInteractions(mockSinkWriter);
       assertSame(serverInital, actualServerInitial.get());
     }
@@ -1476,7 +1483,7 @@ public final class BinlogHelperTest {
           same(trailers),
           eq(Logger.LOGGER_SERVER),
           eq(CALL_ID),
-          isNull(SocketAddress.class));
+          ArgumentMatchers.<SocketAddress>isNull());
       verifyNoMoreInteractions(mockSinkWriter);
       assertSame(status, actualStatus.get());
       assertSame(trailers, actualTrailers.get());

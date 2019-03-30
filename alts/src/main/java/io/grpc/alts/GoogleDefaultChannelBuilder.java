@@ -19,15 +19,11 @@ package io.grpc.alts;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.annotations.VisibleForTesting;
 import io.grpc.CallCredentials;
-import io.grpc.CallOptions;
-import io.grpc.Channel;
-import io.grpc.ClientCall;
-import io.grpc.ClientInterceptor;
 import io.grpc.ForwardingChannelBuilder;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import io.grpc.alts.internal.AltsClientOptions;
+import io.grpc.alts.internal.AltsProtocolNegotiator.LazyChannel;
 import io.grpc.alts.internal.AltsTsiHandshaker;
 import io.grpc.alts.internal.GoogleDefaultProtocolNegotiator;
 import io.grpc.alts.internal.HandshakerServiceGrpc;
@@ -36,7 +32,7 @@ import io.grpc.alts.internal.TsiHandshaker;
 import io.grpc.alts.internal.TsiHandshakerFactory;
 import io.grpc.auth.MoreCallCredentials;
 import io.grpc.internal.GrpcUtil;
-import io.grpc.internal.SharedResourceHolder;
+import io.grpc.internal.SharedResourcePool;
 import io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.InternalNettyChannelBuilder;
 import io.grpc.netty.NettyChannelBuilder;
@@ -69,7 +65,7 @@ public final class GoogleDefaultChannelBuilder
               .withDescription("Failed to get Google default credentials")
               .withCause(e);
     }
-    delegate().intercept(new GoogleDefaultInterceptor(credentials, status));
+    delegate().intercept(new CallCredentialsInterceptor(credentials, status));
   }
 
   /** "Overrides" the static method in {@link ManagedChannelBuilder}. */
@@ -94,24 +90,23 @@ public final class GoogleDefaultChannelBuilder
 
   private final class ProtocolNegotiatorFactory
       implements InternalNettyChannelBuilder.ProtocolNegotiatorFactory {
+
     @Override
     public GoogleDefaultProtocolNegotiator buildProtocolNegotiator() {
+      final LazyChannel lazyHandshakerChannel =
+          new LazyChannel(
+              SharedResourcePool.forResource(HandshakerServiceChannel.SHARED_HANDSHAKER_CHANNEL));
       TsiHandshakerFactory altsHandshakerFactory =
           new TsiHandshakerFactory() {
             @Override
             public TsiHandshaker newHandshaker(String authority) {
-              // Used the shared grpc channel to connecting to the ALTS handshaker service.
-              // TODO: Release the channel if it is not used.
-              // https://github.com/grpc/grpc-java/issues/4755.
-              Channel channel =
-                  SharedResourceHolder.get(HandshakerServiceChannel.SHARED_HANDSHAKER_CHANNEL);
               AltsClientOptions handshakerOptions =
                   new AltsClientOptions.Builder()
                       .setRpcProtocolVersions(RpcProtocolVersionsUtil.getRpcProtocolVersions())
                       .setTargetName(authority)
                       .build();
               return AltsTsiHandshaker.newClient(
-                  HandshakerServiceGrpc.newStub(channel), handshakerOptions);
+                  HandshakerServiceGrpc.newStub(lazyHandshakerChannel.get()), handshakerOptions);
             }
           };
       SslContext sslContext;
@@ -121,30 +116,8 @@ public final class GoogleDefaultChannelBuilder
         throw new RuntimeException(ex);
       }
       return negotiatorForTest =
-          new GoogleDefaultProtocolNegotiator(altsHandshakerFactory, sslContext);
-    }
-  }
-
-  /**
-   * An implementation of {@link ClientInterceptor} that adds Google call credentials on each call.
-   */
-  static final class GoogleDefaultInterceptor implements ClientInterceptor {
-
-    @Nullable private final CallCredentials credentials;
-    private final Status status;
-
-    public GoogleDefaultInterceptor(@Nullable CallCredentials credentials, Status status) {
-      this.credentials = credentials;
-      this.status = status;
-    }
-
-    @Override
-    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
-        MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
-      if (!status.isOk()) {
-        return new FailingClientCall<>(status);
-      }
-      return next.newCall(method, callOptions.withCallCredentials(credentials));
+          new GoogleDefaultProtocolNegotiator(
+              altsHandshakerFactory, lazyHandshakerChannel, sslContext);
     }
   }
 }
